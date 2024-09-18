@@ -3,14 +3,13 @@
 #[cfg(target_os = "wasi")]
 compile_error!("Compiling for WASI targets is not supported!");
 
-use mio::net::TcpListener;
-use mio::{Events, Interest, Poll, Token};
-
 use std::collections::HashMap;
 use std::io::{self, Read};
+use std::sync::Mutex;
 
 use client::{interrupted, Client};
 use server::Server;
+use tokio::net::TcpListener;
 
 // Setup some tokens to allow us to identify which event is for which socket.
 
@@ -23,7 +22,8 @@ pub mod server;
 pub mod util;
 pub mod world;
 
-fn main() -> io::Result<()> {
+#[tokio::main]
+async fn main() -> io::Result<()> {
     use std::sync::Arc;
 
     use entity::player::Player;
@@ -54,32 +54,22 @@ fn main() -> io::Result<()> {
     // ensure rayon is built outside of tokio scope
     rayon::ThreadPoolBuilder::new().build_global().unwrap();
     rt.block_on(async {
-        const SERVER: Token = Token(0);
         use std::time::Instant;
 
         let time = Instant::now();
 
-        // Create a poll instance.
-        let mut poll = Poll::new()?;
-        // Create storage for events.
-        let mut events = Events::with_capacity(128);
-
         // Setup the TCP server socket.
         let addr = BASIC_CONFIG.server_address;
-        let mut listener = TcpListener::bind(addr)?;
-
-        // Register the server with poll we can receive events for it.
-        poll.registry()
-            .register(&mut listener, SERVER, Interest::READABLE)?;
+        let listener = TcpListener::bind(addr).await?;
 
         // Unique token for each incoming connection.
-        let mut unique_token = Token(SERVER.0 + 1);
+        let mut unique_token = 0;
 
         let use_console = ADVANCED_CONFIG.commands.use_console;
         let rcon = ADVANCED_CONFIG.rcon.clone();
 
-        let mut clients: HashMap<Token, Client> = HashMap::new();
-        let mut players: HashMap<Token, Arc<Player>> = HashMap::new();
+        let clients: Arc<Mutex<HashMap<u32, Arc<Client>>>> = Arc::new(Mutex::new(HashMap::new()));
+        let players: Arc<Mutex<HashMap<u32, Arc<Player>>>> = Arc::new(Mutex::new(HashMap::new()));
 
         let server = Arc::new(Server::new());
         log::info!("Started Server took {}ms", time.elapsed().as_millis());
@@ -112,110 +102,75 @@ fn main() -> io::Result<()> {
                 RCONServer::new(&rcon, server).await.unwrap();
             });
         }
+
         loop {
-            if let Err(err) = poll.poll(&mut events, None) {
-                if interrupted(&err) {
-                    continue;
-                }
-                return Err(err);
+            let (socket, address) = listener.accept().await?;
+
+            // Received an event for the TCP server socket, which
+            // indicates we can accept an connection.
+
+            if let Err(e) = socket.set_nodelay(true) {
+                log::warn!("failed to set TCP_NODELAY {e}");
             }
 
-            for event in events.iter() {
-                match event.token() {
-                    SERVER => loop {
-                        // Received an event for the TCP server socket, which
-                        // indicates we can accept an connection.
-                        let (mut connection, address) = match listener.accept() {
-                            Ok((connection, address)) => (connection, address),
-                            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                                // If we get a `WouldBlock` error we know our
-                                // listener has no more incoming connections queued,
-                                // so we can return to polling and wait for some
-                                // more.
-                                break;
-                            }
-                            Err(e) => {
-                                // If it was any other kind of error, something went
-                                // wrong and we terminate with an error.
-                                return Err(e);
-                            }
-                        };
-                        if let Err(e) = connection.set_nodelay(true) {
-                            log::warn!("failed to set TCP_NODELAY {e}");
+            log::info!("Accepted connection from: {}", address);
+
+            unique_token += 1;
+            let token = unique_token;
+            let client = Client::new(token, socket, addr);
+            let mut clients = clients.lock().unwrap();
+            clients.insert(token, Arc::new(client));
+            let players = players.clone();
+
+            tokio::spawn(async move {
+                // Poll Players
+                let players = players.clone();
+                if let Some(player) = players.lock().unwrap().get_mut(&token) {
+                    player.client.poll().await;
+                    let closed = player
+                        .client
+                        .closed
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    if !closed {
+                        player.process_packets(&server).await;
+                    }
+                    if closed {
+                        if let Some(player) = players.lock().unwrap().remove(&token) {
+                            player.remove().await;
                         }
+                    }
+                };
 
-                        log::info!("Accepted connection from: {}", address);
-
-                        let token = next(&mut unique_token);
-                        poll.registry().register(
-                            &mut connection,
-                            token,
-                            Interest::READABLE.add(Interest::WRITABLE),
-                        )?;
-                        let client = Client::new(token, connection, addr);
-                        clients.insert(token, client);
-                    },
-
-                    token => {
-                        // Poll Players
-                        if let Some(player) = players.get_mut(&token) {
-                            player.client.poll(event).await;
-                            let closed = player
-                                .client
-                                .closed
-                                .load(std::sync::atomic::Ordering::Relaxed);
-                            if !closed {
-                                player.process_packets(&server).await;
-                            }
-                            if closed {
-                                if let Some(player) = players.remove(&token) {
-                                    player.remove().await;
-                                    let connection = &mut player.client.connection.lock();
-                                    poll.registry().deregister(connection.by_ref())?;
-                                }
-                            }
-                        };
-
-                        // Poll current Clients (non players)
-                        // Maybe received an event for a TCP connection.
-                        let (done, make_player) = if let Some(client) = clients.get_mut(&token) {
-                            client.poll(event).await;
-                            let closed = client.closed.load(std::sync::atomic::Ordering::Relaxed);
-                            if !closed {
-                                client.process_packets(&server).await;
-                            }
-                            (
-                                closed,
-                                client
-                                    .make_player
-                                    .load(std::sync::atomic::Ordering::Relaxed),
-                            )
-                        } else {
-                            // Sporadic events happen, we can safely ignore them.
-                            (false, false)
-                        };
-                        if done || make_player {
-                            if let Some(client) = clients.remove(&token) {
-                                if done {
-                                    let connection = &mut client.connection.lock();
-                                    poll.registry().deregister(connection.by_ref())?;
-                                } else if make_player {
-                                    let token = client.token;
-                                    let (player, world) = server.add_player(token, client).await;
-                                    players.insert(token, player.clone());
-                                    world.spawn_player(&BASIC_CONFIG, player).await;
-                                }
-                            }
+                // Poll current Clients (non players)
+                // Maybe received an event for a TCP connection.
+                let (done, make_player) = if let Some(client) = clients.get_mut(&token) {
+                    client.poll().await;
+                    let closed = client.closed.load(std::sync::atomic::Ordering::Relaxed);
+                    if !closed {
+                        client.process_packets(&server).await;
+                    }
+                    (
+                        closed,
+                        client
+                            .make_player
+                            .load(std::sync::atomic::Ordering::Relaxed),
+                    )
+                } else {
+                    // Sporadic events happen, we can safely ignore them.
+                    (false, false)
+                };
+                if done || make_player {
+                    if let Some(client) = clients.remove(&token) {
+                        if done {
+                        } else if make_player {
+                            let token = client.id;
+                            let (player, world) = server.add_player(token, *client).await;
+                            players.lock().unwrap().insert(token, player.clone());
+                            world.spawn_player(&BASIC_CONFIG, player).await;
                         }
                     }
                 }
-            }
+            });
         }
     })
-}
-
-fn next(current: &mut Token) -> Token {
-    let next = current.0;
-    current.0 += 1;
-    Token(next)
 }

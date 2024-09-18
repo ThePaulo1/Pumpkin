@@ -35,8 +35,8 @@ use crate::{
 pub struct World {
     /// The underlying level, responsible for chunk management and terrain generation.
     pub level: Arc<Mutex<Level>>,
-    /// A map of active players within the world, keyed by their unique token.
-    pub current_players: Arc<Mutex<HashMap<Token, Arc<Player>>>>,
+    /// A map of active players within the world, keyed by their unique id.
+    pub current_players: Arc<Mutex<HashMap<u32, Arc<Player>>>>,
     // TODO: entities
 }
 
@@ -279,18 +279,18 @@ impl World {
         None
     }
 
-    pub fn add_player(&self, token: Token, player: Arc<Player>) {
-        self.current_players.lock().insert(token, player);
+    pub fn add_player(&self, id: u32, player: Arc<Player>) {
+        self.current_players.lock().insert(id, player);
     }
 
     pub fn remove_player(&self, player: &Player) {
         self.current_players
             .lock()
-            .remove(&player.client.token)
+            .remove(&player.client.id)
             .unwrap();
         let uuid = player.gameprofile.id;
         self.broadcast_packet_expect(
-            &[player.client.token],
+            &[player.client.id],
             &CRemovePlayerInfo::new(1.into(), &[uuid]),
         );
         self.remove_entity(&player.entity);

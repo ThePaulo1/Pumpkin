@@ -14,7 +14,6 @@ use crate::{
 
 use authentication::GameProfile;
 use crossbeam::atomic::AtomicCell;
-use mio::{event::Event, net::TcpStream, Token};
 use parking_lot::Mutex;
 use pumpkin_core::text::TextComponent;
 use pumpkin_protocol::{
@@ -29,6 +28,13 @@ use pumpkin_protocol::{
         status::{SStatusPingRequest, SStatusRequest},
     },
     ClientPacket, ConnectionState, PacketError, RawPacket, ServerPacket,
+};
+use tokio::{
+    io::{AsyncReadExt, ReadHalf},
+    net::{
+        tcp::{OwnedReadHalf, OwnedWriteHalf},
+        TcpStream,
+    },
 };
 
 use std::io::Read;
@@ -98,10 +104,10 @@ pub struct Client {
     pub encryption: AtomicBool,
     /// Indicates if the client connection is closed.
     pub closed: AtomicBool,
-    /// A unique token identifying the client.
-    pub token: Token,
-    /// The underlying TCP connection to the client.
-    pub connection: Arc<Mutex<TcpStream>>,
+    /// A unique id identifying the client.
+    pub id: u32,
+    pub connection_writer: Mutex<OwnedWriteHalf>,
+    pub connection_reader: Mutex<OwnedReadHalf>,
     /// The client's IP address.
     pub address: Mutex<SocketAddr>,
     /// The packet encoder for outgoing packets.
@@ -116,22 +122,24 @@ pub struct Client {
 }
 
 impl Client {
-    pub fn new(token: Token, connection: TcpStream, address: SocketAddr) -> Self {
+    pub fn new(id: u32, connection: TcpStream, address: SocketAddr) -> Self {
+        let (connection_reader, connection_writer) = connection.into_split();
         Self {
             protocol_version: AtomicI32::new(0),
             gameprofile: Mutex::new(None),
             config: Mutex::new(None),
             brand: Mutex::new(None),
-            token,
+            id,
             address: Mutex::new(address),
             connection_state: AtomicCell::new(ConnectionState::HandShake),
-            connection: Arc::new(Mutex::new(connection)),
             enc: Arc::new(Mutex::new(PacketEncoder::default())),
             dec: Arc::new(Mutex::new(PacketDecoder::default())),
             encryption: AtomicBool::new(false),
             closed: AtomicBool::new(false),
             client_packets_queue: Arc::new(Mutex::new(Vec::new())),
             make_player: AtomicBool::new(false),
+            connection_reader: Mutex::new(connection_reader),
+            connection_writer: Mutex::new(connection_writer),
         }
     }
 
@@ -309,45 +317,39 @@ impl Client {
 
     /// Reads the connection until our buffer of len 4096 is full, then decode
     /// Close connection when an error occurs or when the Client closed the connection
-    pub async fn poll(&self, event: &Event) {
-        if event.is_readable() {
-            let mut received_data = vec![0; 4096];
-            let mut bytes_read = 0;
-            loop {
-                let connection = self.connection.clone();
-                let mut connection = connection.lock();
-                match connection.read(&mut received_data[bytes_read..]) {
-                    Ok(0) => {
-                        // Reading 0 bytes means the other side has closed the
-                        // connection or is done writing, then so are we.
-                        self.close();
-                        break;
-                    }
-                    Ok(n) => {
-                        bytes_read += n;
-                        received_data.extend(&vec![0; n]);
-                    }
-                    // Would block "errors" are the OS's way of saying that the
-                    // connection is not actually ready to perform this I/O operation.
-                    Err(ref err) if would_block(err) => break,
-                    Err(ref err) if interrupted(err) => continue,
-                    // Other errors we'll consider fatal.
-                    Err(_) => self.close(),
+    pub async fn poll(&self) {
+        let mut received_data = vec![0; 4096];
+        // We can (maybe) read from the connection.
+        while !self.closed.load(std::sync::atomic::Ordering::Relaxed) {
+            // self.connection.readable().await.expect(":c");
+            match self.connection_reader.lock().read(&mut received_data).await {
+                Ok(0) => {
+                    // Reading 0 bytes means the other side has closed the
+                    // connection or is done writing, then so are we.
+                    self.close();
+                    break;
                 }
-            }
-
-            if bytes_read != 0 {
-                let mut dec = self.dec.lock();
-                dec.queue_slice(&received_data[..bytes_read]);
-                match dec.decode() {
-                    Ok(packet) => {
-                        if let Some(packet) = packet {
-                            self.add_packet(packet);
+                Ok(n) => {
+                    dbg!(n);
+                    received_data.extend(&vec![0; n]);
+                    let mut dec = self.dec.lock();
+                    dec.queue_slice(&received_data);
+                    match dec.decode() {
+                        Ok(packet) => {
+                            if let Some(packet) = packet {
+                                self.add_packet(packet);
+                            }
                         }
+                        Err(err) => self.kick(&err.to_string()),
                     }
-                    Err(err) => self.kick(&err.to_string()),
+                    dec.clear();
                 }
-                dec.clear();
+                // Would block "errors" are the OS's way of saying that the
+                // connection is not actually ready to perform this I/O operation.
+                Err(ref err) if would_block(err) => break,
+                Err(ref err) if interrupted(err) => continue,
+                // Other errors we'll consider fatal.
+                Err(_) => self.close(),
             }
         }
     }
